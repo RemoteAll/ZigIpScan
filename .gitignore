@@ -1,0 +1,30 @@
+# Zig build artifacts
+zig-cache/
+.zig-cache/
+zig-out/
+
+# Compiled binaries & objects (when using zig build-exe)
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.log
+*~
+*.swp
+*.swo
+
+# OS-specific noise
+.DS_Store
+Thumbs.db
+
+# Editor/IDE configs
+.vscode/
+*.code-workspace
+.idea/
+.vs/
+.history/
