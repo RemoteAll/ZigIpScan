@@ -119,20 +119,8 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     if (std.mem.eql(u8, mode, "cidr")) {
         defer allocator.free(cidr_buf);
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 CIDR={s}", .{cidr_buf});
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 解析 CIDR 网段\n", .{});
-            std.debug.print("  - 枚举所有 IP 地址\n", .{});
-            std.debug.print("  - TCP 探测 + ICMP ping (如有权限)\n", .{});
-            std.debug.print("  - 输出活跃主机列表\n", .{});
             try Scan.discoverRange(allocator, cidr_buf);
         } else {
-            std.log.info("端口扫描 CIDR={s}, port={d}", .{ cidr_buf, port });
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 解析 CIDR 网段\n", .{});
-            std.debug.print("  - 枚举所有 IP 地址\n", .{});
-            std.debug.print("  - TCP 端口 {} 连通性检测\n", .{port});
-            std.debug.print("  - 输出开放端口的主机列表\n", .{});
             try Scan.scanRange(allocator, cidr_buf, port);
         }
     } else if (std.mem.eql(u8, mode, "local")) {
@@ -151,16 +139,9 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 局域网", .{});
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 枚举所有活跃网卡\n", .{});
-            std.debug.print("  - 扫描每个网卡的子网\n", .{});
-            std.debug.print("  - 合并结果并去重\n", .{});
+            try Scan.discoverLan(allocator);
         } else {
-            std.log.info("端口扫描 局域网, port={d}", .{port});
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 枚举所有活跃网卡\n", .{});
-            std.debug.print("  - 扫描每个网卡子网的端口 {} 开放情况\n", .{port});
+            try Scan.scanLan(allocator, port);
         }
     }
 }
@@ -244,11 +225,9 @@ pub fn main() !void {
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 局域网所有网卡子网 (未实现)", .{});
-            // TODO: 列举所有活动网卡并对其子网进行主机发现
+            try Scan.discoverLan(allocator);
         } else {
-            std.log.info("端口扫描 局域网所有网卡子网, port={d} (未实现)", .{port});
-            // TODO: 列举所有活动网卡并对其子网进行端口扫描
+            try Scan.scanLan(allocator, port);
         }
     } else {
         std.log.err("不支持的模式: {s}", .{mode});
