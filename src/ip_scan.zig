@@ -193,38 +193,6 @@ fn arpScan(ip: u32, mac_out: *[6]u8) bool {
 }
 
 /// 尝试获取主机名（通过 DNS 反向查询）
-fn getHostname(allocator: std.mem.Allocator, ip: u32) ?[]const u8 {
-    var ip_buf: [16]u8 = undefined;
-    const ip_str = ipToString(ip, &ip_buf) catch return null;
-
-    // 尝试 DNS 反向查询
-    // 注意：这可能比较慢，建议在后台线程执行
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "nslookup", ip_str },
-    }) catch return null;
-
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    // 解析 nslookup 输出中的主机名
-    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "Name:") != null) {
-            var parts = std.mem.splitScalar(u8, line, ':');
-            _ = parts.next();
-            if (parts.next()) |name_part| {
-                const name = std.mem.trim(u8, name_part, " \r\n\t");
-                if (name.len > 0) {
-                    return allocator.dupe(u8, name) catch null;
-                }
-            }
-        }
-    }
-
-    return null;
-}
-
 /// 使用 ARP 发现主机（推荐方法，最快）
 fn discoverHostByArp(_: std.mem.Allocator, ip: u32) !bool {
     var mac: [6]u8 = undefined;
@@ -258,11 +226,10 @@ fn arpWorker(task: *ArpScanTask) void {
 
         var mac: [6]u8 = undefined;
         if (arpScan(ip, &mac)) {
-            const hostname: ?[]const u8 = null;
             local_hosts.append(task.allocator, .{
                 .ip = ip,
                 .mac = mac,
-                .hostname = hostname,
+                .hostname = null, // 禁用主机名解析以提升速度
             }) catch {};
         }
 
