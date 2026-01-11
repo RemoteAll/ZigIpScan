@@ -21,13 +21,13 @@ fn printUsage() void {
 /// 适用于 Zig 0.15.2
 fn readLineSimple(allocator: std.mem.Allocator) ![]u8 {
     const builtin = @import("builtin");
-    
+
     var buffer: [4096]u8 = undefined;
     const bytes_read = if (builtin.os.tag == .windows) blk: {
         const w = std.os.windows;
         const stdin_handle = w.kernel32.GetStdHandle(w.STD_INPUT_HANDLE) orelse return error.InvalidHandle;
         if (stdin_handle == w.INVALID_HANDLE_VALUE) return error.InvalidHandle;
-        
+
         var bytes: w.DWORD = 0;
         if (w.kernel32.ReadFile(stdin_handle, &buffer, buffer.len, &bytes, null) == 0) {
             return error.ReadFailed;
@@ -36,9 +36,9 @@ fn readLineSimple(allocator: std.mem.Allocator) ![]u8 {
     } else blk: {
         break :blk try std.posix.read(std.posix.STDIN_FILENO, &buffer);
     };
-    
+
     if (bytes_read == 0) return error.EndOfStream;
-    
+
     // 去除换行符
     const line = buffer[0..bytes_read];
     const trimmed = std.mem.trimRight(u8, line, &[_]u8{ '\r', '\n' });
@@ -48,12 +48,25 @@ fn readLineSimple(allocator: std.mem.Allocator) ![]u8 {
 fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     // 初始化控制台支持中文和颜色
     _ = zzig.Console.init(.{});
-    
+
     std.debug.print("\n=== Zig IP Scan 交互式菜单 ===\n", .{});
-    std.debug.print("请选择扫描模式:\n", .{});
-    std.debug.print("  1) 本机子网 (local)\n", .{});
-    std.debug.print("  2) 指定CIDR (cidr)\n", .{});
-    std.debug.print("  3) 局域网 (lan)\n", .{});
+
+    // 第一步: 选择操作类型
+    std.debug.print("\n请选择操作:\n", .{});
+    std.debug.print("  1) 主机发现 (discover) - 扫描活跃主机\n", .{});
+    std.debug.print("  2) 端口扫描 (scan) - 检测端口开放情况\n", .{});
+    std.debug.print("输入序号 (默认 1): ", .{});
+
+    const action_input = readLineSimple(allocator) catch "";
+    defer if (action_input.len > 0) allocator.free(action_input);
+
+    const action = if (std.mem.eql(u8, action_input, "2")) "scan" else "discover";
+
+    // 第二步: 选择扫描模式
+    std.debug.print("\n请选择扫描范围:\n", .{});
+    std.debug.print("  1) 本机子网 (local) - 自动检测网卡\n", .{});
+    std.debug.print("  2) 指定网段 (cidr) - 手动输入 CIDR\n", .{});
+    std.debug.print("  3) 局域网 (lan) - 所有网卡的子网\n", .{});
     std.debug.print("输入序号: ", .{});
 
     const mode_input = readLineSimple(allocator) catch |err| {
@@ -73,18 +86,8 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
         return;
     };
 
-    std.debug.print("\n选择操作 (默认 1):\n", .{});
-    std.debug.print("  1) 主机发现 (discover)\n", .{});
-    std.debug.print("  2) 端口扫描 (scan)\n", .{});
-    std.debug.print("输入序号: ", .{});
-
-    const action_input = readLineSimple(allocator) catch "";
-    defer if (action_input.len > 0) allocator.free(action_input);
-
-    const action = if (std.mem.eql(u8, action_input, "2")) "scan" else "discover";
-
+    // 第三步: 根据模式获取额外参数
     var cidr_buf: []u8 = &[_]u8{};
-    var iface_buf: []u8 = &[_]u8{};
     var port: u16 = 80;
 
     if (std.mem.eql(u8, mode, "cidr")) {
@@ -95,10 +98,12 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
             return;
         }
     } else if (std.mem.eql(u8, mode, "local")) {
-        std.debug.print("\n指定网卡名 (直接回车跳过): ", .{});
-        iface_buf = readLineSimple(allocator) catch "";
+        // 本机子网模式:自动检测网卡,无需用户输入
+        std.debug.print("\n正在自动检测本机网卡...\n", .{});
+        // 稍后实现网卡检测逻辑
     }
 
+    // 第四步: 如果是端口扫描,获取端口号
     if (std.mem.eql(u8, action, "scan")) {
         std.debug.print("\n请输入端口 (默认 80): ", .{});
         const port_input = readLineSimple(allocator) catch "";
@@ -115,23 +120,47 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
         defer allocator.free(cidr_buf);
         if (std.mem.eql(u8, action, "discover")) {
             std.log.info("主机发现 CIDR={s}", .{cidr_buf});
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 解析 CIDR 网段\n", .{});
+            std.debug.print("  - 枚举所有 IP 地址\n", .{});
+            std.debug.print("  - TCP 探测 + ICMP ping (如有权限)\n", .{});
+            std.debug.print("  - 输出活跃主机列表\n", .{});
             try Scan.discoverRange(allocator, cidr_buf);
         } else {
             std.log.info("端口扫描 CIDR={s}, port={d}", .{ cidr_buf, port });
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 解析 CIDR 网段\n", .{});
+            std.debug.print("  - 枚举所有 IP 地址\n", .{});
+            std.debug.print("  - TCP 端口 {} 连通性检测\n", .{port});
+            std.debug.print("  - 输出开放端口的主机列表\n", .{});
             try Scan.scanRange(allocator, cidr_buf, port);
         }
     } else if (std.mem.eql(u8, mode, "local")) {
-        defer if (iface_buf.len > 0) allocator.free(iface_buf);
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 本机子网 (iface={s})", .{iface_buf});
+            std.log.info("主机发现 本机子网", .{});
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 自动检测本机活跃网卡\n", .{});
+            std.debug.print("  - 获取网卡 IP 和子网掩码\n", .{});
+            std.debug.print("  - 计算 CIDR 网段\n", .{});
+            std.debug.print("  - 扫描同子网的活跃主机\n", .{});
         } else {
-            std.log.info("端口扫描 本机子网 (iface={s}), port={d}", .{ iface_buf, port });
+            std.log.info("端口扫描 本机子网, port={d}", .{port});
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 自动检测本机活跃网卡\n", .{});
+            std.debug.print("  - 扫描同子网的端口 {} 开放情况\n", .{port});
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 局域网 (未实现)", .{});
+            std.log.info("主机发现 局域网", .{});
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 枚举所有活跃网卡\n", .{});
+            std.debug.print("  - 扫描每个网卡的子网\n", .{});
+            std.debug.print("  - 合并结果并去重\n", .{});
         } else {
-            std.log.info("端口扫描 局域网, port={d} (未实现)", .{port});
+            std.log.info("端口扫描 局域网, port={d}", .{port});
+            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
+            std.debug.print("  - 枚举所有活跃网卡\n", .{});
+            std.debug.print("  - 扫描每个网卡子网的端口 {} 开放情况\n", .{port});
         }
     }
 }
