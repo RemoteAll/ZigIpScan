@@ -115,6 +115,13 @@ fn parseCidr(cidr: []const u8) !CidrInfo {
     };
 }
 
+/// 主机信息结构
+const HostInfo = struct {
+    ip: u32,
+    mac: [6]u8,
+    hostname: ?[]const u8, // 可选的主机名
+};
+
 /// 将 u32 IP 转换为字符串（主机字节序）
 fn ipToString(ip: u32, buf: []u8) ![]u8 {
     const a = @as(u8, @intCast((ip >> 24) & 0xFF));
@@ -123,6 +130,11 @@ fn ipToString(ip: u32, buf: []u8) ![]u8 {
     const d = @as(u8, @intCast(ip & 0xFF));
 
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a, b, c, d });
+}
+
+/// 格式化 MAC 地址为字符串
+fn macToString(mac: [6]u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] });
 }
 
 /// 测试 TCP 端口连通性
@@ -158,19 +170,18 @@ fn discoverHost(allocator: std.mem.Allocator, ip: u32) !bool {
     return false;
 }
 
-/// 使用 ARP 检测主机（最快最准确）
-fn arpScan(ip: u32) bool {
+/// 使用 ARP 检测主机并获取 MAC 地址
+fn arpScan(ip: u32, mac_out: *[6]u8) bool {
     const builtin = @import("builtin");
 
     if (builtin.os.tag == .windows) {
         // Windows: 使用 SendARP API
-        var mac_addr: [6]u8 = undefined;
         var mac_len: windows.ULONG = 6;
 
         // IP 需要转换为网络字节序
         const net_ip = @byteSwap(ip);
 
-        const result = windows.SendARP(net_ip, 0, &mac_addr, &mac_len);
+        const result = windows.SendARP(net_ip, 0, mac_out, &mac_len);
 
         // NO_ERROR = 0 表示成功
         return result == 0 and mac_len == 6;
@@ -181,9 +192,43 @@ fn arpScan(ip: u32) bool {
     }
 }
 
+/// 尝试获取主机名（通过 DNS 反向查询）
+fn getHostname(allocator: std.mem.Allocator, ip: u32) ?[]const u8 {
+    var ip_buf: [16]u8 = undefined;
+    const ip_str = ipToString(ip, &ip_buf) catch return null;
+
+    // 尝试 DNS 反向查询
+    // 注意：这可能比较慢，建议在后台线程执行
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "nslookup", ip_str },
+    }) catch return null;
+
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // 解析 nslookup 输出中的主机名
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Name:") != null) {
+            var parts = std.mem.splitScalar(u8, line, ':');
+            _ = parts.next();
+            if (parts.next()) |name_part| {
+                const name = std.mem.trim(u8, name_part, " \r\n\t");
+                if (name.len > 0) {
+                    return allocator.dupe(u8, name) catch null;
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
 /// 使用 ARP 发现主机（推荐方法，最快）
 fn discoverHostByArp(_: std.mem.Allocator, ip: u32) !bool {
-    return arpScan(ip);
+    var mac: [6]u8 = undefined;
+    return arpScan(ip, &mac);
 }
 
 /// 并发 ARP 扫描任务上下文
@@ -192,7 +237,7 @@ const ArpScanTask = struct {
     scan_list: []const u32, // 要扫描的 IP 列表
     start_idx: usize, // 起始索引
     end_idx: usize, // 结束索引
-    found_ips: *std.ArrayList(u32),
+    found_hosts: *std.ArrayList(HostInfo),
     mutex: *std.Thread.Mutex,
     progress_counter: *usize,
     total_count: usize,
@@ -200,32 +245,52 @@ const ArpScanTask = struct {
 
 /// ARP 工作线程
 fn arpWorker(task: *ArpScanTask) void {
+    // 批量缓存结果，减少锁竞争
+    var local_hosts: std.ArrayList(HostInfo) = .{};
+    defer local_hosts.deinit(task.allocator);
+
+    var local_progress: usize = 0;
+    const batch_size: usize = 2; // 每 2 个 IP 更新一次进度，提高实时性
+
     for (task.start_idx..task.end_idx) |idx| {
         const ip = task.scan_list[idx];
+        local_progress += 1;
 
-        // 更新进度
-        {
-            task.mutex.lock();
-            defer task.mutex.unlock();
-            task.progress_counter.* += 1;
+        var mac: [6]u8 = undefined;
+        if (arpScan(ip, &mac)) {
+            const hostname: ?[]const u8 = null;
+            local_hosts.append(task.allocator, .{
+                .ip = ip,
+                .mac = mac,
+                .hostname = hostname,
+            }) catch {};
         }
 
-        if (discoverHostByArp(task.allocator, ip) catch false) {
+        // 批量更新进度和结果
+        if (local_progress >= batch_size or idx == task.end_idx - 1) {
             task.mutex.lock();
             defer task.mutex.unlock();
-            task.found_ips.append(task.allocator, ip) catch {};
+
+            task.progress_counter.* += local_progress;
+            local_progress = 0;
+
+            // 批量添加发现的主机
+            for (local_hosts.items) |host| {
+                task.found_hosts.append(task.allocator, host) catch {};
+            }
+            local_hosts.clearRetainingCapacity();
         }
     }
 }
 
 /// 并发 ARP 扫描（带智能顺序优化）
-fn discoverHostByArpConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize) !std.ArrayList(u32) {
+fn discoverHostByArpConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize) !std.ArrayList(HostInfo) {
     return discoverHostByArpConcurrentWithPriority(allocator, base_ip, host_count, thread_count, null);
 }
 
 /// 并发 ARP 扫描（可指定优先扫描的 IP）
-fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize, local_ip: ?u32) !std.ArrayList(u32) {
-    var found_ips: std.ArrayList(u32) = .{};
+fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize, local_ip: ?u32) !std.ArrayList(HostInfo) {
+    var found_hosts: std.ArrayList(HostInfo) = .{};
     var mutex = std.Thread.Mutex{};
     var progress_counter: usize = 0;
 
@@ -307,7 +372,7 @@ fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip
             .scan_list = scan_order,
             .start_idx = start_idx,
             .end_idx = end_idx,
-            .found_ips = &found_ips,
+            .found_hosts = &found_hosts,
             .mutex = &mutex,
             .progress_counter = &progress_counter,
             .total_count = host_count,
@@ -318,35 +383,53 @@ fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip
         }
     }
 
-    // 显示进度
+    // 显示进度（降低更新频率减少开销）
     const start_time = std.time.milliTimestamp();
-    while (progress_counter < host_count) {
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // 进度显示循环
+    while (true) {
+        std.Thread.sleep(500 * std.time.ns_per_ms); // 500ms 更新一次，提高响应性
+
+        const current_time = std.time.milliTimestamp();
 
         mutex.lock();
         const current_progress = progress_counter;
-        const current_found = found_ips.items.len;
+        const current_found = found_hosts.items.len;
+        const is_complete = current_progress >= host_count;
         mutex.unlock();
 
+        if (is_complete) break; // 扫描完成，跳出循环
+
         const progress = @as(f64, @floatFromInt(current_progress)) / @as(f64, @floatFromInt(host_count)) * 100;
-        const elapsed = @divFloor(std.time.milliTimestamp() - start_time, 1000);
-        const speed = if (elapsed > 0) @divFloor(current_progress, @as(usize, @intCast(elapsed))) else 0;
-        std.debug.print("  进度: {d:.1}% ({d}/{d}) 已发现: {d} 速度: ~{d}IP/s        \r", .{ progress, current_progress, host_count, current_found, speed });
+
+        // 计算总体平均速度（从开始到现在）- 更稳定可靠
+        const elapsed_ms = current_time - start_time;
+        const avg_speed = if (current_progress > 0 and elapsed_ms >= 500) blk: {
+            const calculated = @divFloor(current_progress * 1000, @as(usize, @intCast(elapsed_ms)));
+            // 至少显示 1 IP/s，避免因整数除法导致的 0
+            break :blk if (calculated > 0) calculated else 1;
+        } else if (current_progress > 0) // 0.5秒内显示估算值
+            if (current_progress * 2 > 0) current_progress * 2 else 1
+        else
+            0;
+
+        std.debug.print("\r  进度: {d:.1}% ({d}/{d}) 已发现: {d} 速度: ~{d}IP/s                    ", .{ progress, current_progress, host_count, current_found, avg_speed });
     }
 
     // 等待所有线程完成
     for (0..thread_count) |i| {
-        const start = base_ip + 1 + @as(u32, @intCast(i * ips_per_thread));
-        const end = @min(start + @as(u32, @intCast(ips_per_thread)), base_ip + host_count + 1);
-        if (start < end) {
+        const start_idx = i * ips_per_thread;
+        const end_idx = @min(start_idx + ips_per_thread, host_count);
+        if (start_idx < end_idx) {
             threads[i].join();
         }
     }
 
     const total_time = @divFloor(std.time.milliTimestamp() - start_time, 1000);
-    std.debug.print("\n⚡ 扫描完成！用时 {d} 秒                                    \n\n", .{total_time});
+    const avg_speed = if (total_time > 0) @divFloor(host_count, @as(usize, @intCast(total_time))) else 0;
+    std.debug.print("\n⚡ 扫描完成！用时 {d} 秒，平均速度 {d} IP/s                  \n\n", .{ total_time, avg_speed });
 
-    return found_ips;
+    return found_hosts;
 }
 
 /// 使用 ICMP Ping 检测主机（更快更准确）
@@ -621,8 +704,8 @@ pub fn discoverRange(allocator: std.mem.Allocator, cidr: []const u8) !void {
     std.debug.print("  可扫描主机数: {d}\n", .{cidr_info.host_count});
 
     // ARP 扫描速度估算（非常快，每个 IP 约 5-10ms）
-    const thread_count: usize = 16; // ARP 快，可以用更多线程
-    const estimated_seconds = (cidr_info.host_count * 10) / 1000; // 每个IP约10ms
+    const thread_count: usize = 64; // ARP 是 I/O 密集型，使用更多线程加速
+    const estimated_seconds = (cidr_info.host_count * 8) / 1000; // 优化后约8ms/IP
     std.debug.print("  预估时间(ARP): ~{d} 秒 (使用 {d} 线程)\n\n", .{ estimated_seconds, thread_count });
 
     if (cidr_info.host_count > 1024) {
@@ -630,23 +713,41 @@ pub fn discoverRange(allocator: std.mem.Allocator, cidr: []const u8) !void {
     }
 
     // 使用 ARP 并发扫描
-    var found_ips = try discoverHostByArpConcurrent(allocator, cidr_info.base_ip, cidr_info.host_count, thread_count);
-    defer found_ips.deinit(allocator);
+    var found_hosts = try discoverHostByArpConcurrent(allocator, cidr_info.base_ip, cidr_info.host_count, thread_count);
+    defer {
+        for (found_hosts.items) |host| {
+            if (host.hostname) |name| {
+                allocator.free(name);
+            }
+        }
+        found_hosts.deinit(allocator);
+    }
 
     // 清除进度行
     std.debug.print("\n", .{});
 
     // 打印发现的主机
-    if (found_ips.items.len > 0) {
+    if (found_hosts.items.len > 0) {
         std.debug.print("发现的主机:\n", .{});
-        for (found_ips.items) |ip| {
+        std.debug.print("{s:<16}  {s:<18}  {s}\n", .{ "IP 地址", "MAC 地址", "状态" });
+        std.debug.print("{s}\n", .{"-" ** 60});
+
+        for (found_hosts.items) |host| {
             var ip_buf: [16]u8 = undefined;
-            const ip_str = try ipToString(ip, &ip_buf);
-            std.debug.print("✓ {s}  [在线]\n", .{ip_str});
+            const ip_str = try ipToString(host.ip, &ip_buf);
+
+            var mac_buf: [18]u8 = undefined;
+            const mac_str = try macToString(host.mac, &mac_buf);
+
+            if (host.hostname) |hostname_str| {
+                std.debug.print("{s:<16}  {s:<18}  {s}\n", .{ ip_str, mac_str, hostname_str });
+            } else {
+                std.debug.print("{s:<16}  {s:<18}  [在线]\n", .{ ip_str, mac_str });
+            }
         }
     }
 
-    std.debug.print("\n📊 扫描完成: 发现 {d} 个活跃主机\n", .{found_ips.items.len});
+    std.debug.print("\n📊 扫描完成: 发现 {d} 个活跃主机\n", .{found_hosts.items.len});
 }
 
 /// 网卡信息结构
@@ -1071,25 +1172,43 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         const cidr_info = try parseCidr(iface.cidr);
 
         // ARP 扫描速度估算
-        const thread_count: usize = 16;
-        const estimated_seconds = (cidr_info.host_count * 10) / 1000;
+        const thread_count: usize = 64;
+        const estimated_seconds = (cidr_info.host_count * 8) / 1000;
         std.debug.print("  主机数: {d}, 预估: ~{d}秒 (ARP)\n", .{ cidr_info.host_count, estimated_seconds });
 
         // 使用 ARP 并发扫描
-        var found_ips = try discoverHostByArpConcurrent(allocator, cidr_info.base_ip, cidr_info.host_count, thread_count);
-        defer found_ips.deinit(allocator);
+        var found_hosts = try discoverHostByArpConcurrent(allocator, cidr_info.base_ip, cidr_info.host_count, thread_count);
+        defer {
+            for (found_hosts.items) |host| {
+                if (host.hostname) |name| {
+                    allocator.free(name);
+                }
+            }
+            found_hosts.deinit(allocator);
+        }
 
         std.debug.print("\n", .{});
 
         // 打印发现的主机
-        for (found_ips.items) |ip| {
-            var ip_buf: [16]u8 = undefined;
-            const ip_str = try ipToString(ip, &ip_buf);
-            std.debug.print("  ✓ {s}  [在线]\n", .{ip_str});
+        if (found_hosts.items.len > 0) {
+            for (found_hosts.items) |host| {
+                var ip_buf: [16]u8 = undefined;
+                const ip_str = try ipToString(host.ip, &ip_buf);
+
+                var mac_buf: [18]u8 = undefined;
+                const mac_str = try macToString(host.mac, &mac_buf);
+
+                const hostname_str = host.hostname orelse "";
+                if (hostname_str.len > 0) {
+                    std.debug.print("  ✓ {s:<16}  [{s}]  ({s})\n", .{ ip_str, mac_str, hostname_str });
+                } else {
+                    std.debug.print("  ✓ {s:<16}  [{s}]\n", .{ ip_str, mac_str });
+                }
+            }
         }
 
-        std.debug.print("  子网发现: {d} 个活跃主机\n", .{found_ips.items.len});
-        total_found += found_ips.items.len;
+        std.debug.print("  子网发现: {d} 个活跃主机\n", .{found_hosts.items.len});
+        total_found += found_hosts.items.len;
     }
 
     std.debug.print("\n\n📊 局域网扫描完成: 总计发现 {d} 个活跃主机\n", .{total_found});
