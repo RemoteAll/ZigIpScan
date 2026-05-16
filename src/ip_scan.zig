@@ -64,6 +64,62 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn parseIpv4Text(ip_str: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var iter = std.mem.splitScalar(u8, ip_str, '.');
+    var index: usize = 0;
+
+    while (iter.next()) |octet_str| : (index += 1) {
+        if (index >= 4) return null;
+        octets[index] = std.fmt.parseUnsigned(u8, octet_str, 10) catch return null;
+    }
+
+    if (index != 4) return null;
+
+    return (@as(u32, octets[0]) << 24) |
+        (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) |
+        @as(u32, octets[3]);
+}
+
+fn appendInterface(allocator: std.mem.Allocator, interfaces: *std.ArrayList(NetworkInterface), name: []const u8, description: []const u8, ip: u32, prefix_len: u8) !void {
+    const ip_octets = [4]u8{
+        @intCast((ip >> 24) & 0xFF),
+        @intCast((ip >> 16) & 0xFF),
+        @intCast((ip >> 8) & 0xFF),
+        @intCast(ip & 0xFF),
+    };
+
+    if (ip_octets[0] == 127 or (ip_octets[0] == 169 and ip_octets[1] == 254)) return;
+    if (prefix_len > 32) return;
+
+    const host_bits: u5 = @intCast(32 - prefix_len);
+    const mask: u32 = if (prefix_len == 0) 0 else ~@as(u32, 0) << host_bits;
+    const network_ip = ip & mask;
+
+    const network_octets = [4]u8{
+        @intCast((network_ip >> 24) & 0xFF),
+        @intCast((network_ip >> 16) & 0xFF),
+        @intCast((network_ip >> 8) & 0xFF),
+        @intCast(network_ip & 0xFF),
+    };
+
+    var cidr_buf: [20]u8 = undefined;
+    const cidr = try std.fmt.bufPrint(&cidr_buf, "{d}.{d}.{d}.{d}/{d}", .{ network_octets[0], network_octets[1], network_octets[2], network_octets[3], prefix_len });
+
+    const resolved_description = if (description.len > 0) description else name;
+    const is_virtual = isVirtualAdapter(resolved_description);
+
+    try interfaces.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .description = try allocator.dupe(u8, resolved_description),
+        .ip = ip,
+        .cidr = try allocator.dupe(u8, cidr),
+        .prefix_len = prefix_len,
+        .is_virtual = is_virtual,
+    });
+}
+
 /// 计算子网掩码中 1 的位数
 fn countMaskBits(mask: u32) u8 {
     var count: u8 = 0;
@@ -743,206 +799,37 @@ fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
     const builtin = @import("builtin");
 
     if (builtin.os.tag == .windows) {
-        // Windows: 使用 ipconfig /all 命令解析（获取描述信息）
-        const result = try compat.process.run(allocator, .{
-            .argv = &[_][]const u8{ "cmd", "/c", "chcp 65001 >nul && ipconfig /all" },
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
+        // Windows: 优先使用 PowerShell 结构化输出，避免 ipconfig 本地化/编码问题
+        const ps_result = compat.process.run(allocator, .{
+            .argv = &[_][]const u8{
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | ForEach-Object { foreach ($ipv4 in $_.IPv4Address) { \"{0}`t{1}`t{2}`t{3}\" -f $_.InterfaceAlias, $_.InterfaceDescription, $ipv4.IPAddress, $ipv4.PrefixLength } }",
+            },
+        }) catch {
+            return try interfaces.toOwnedSlice(allocator);
+        };
+        defer allocator.free(ps_result.stdout);
+        defer allocator.free(ps_result.stderr);
 
-        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-        var current_name: ?[]const u8 = null;
-        var current_description: ?[]const u8 = null;
-        var current_ip: ?u32 = null;
-        var current_mask: ?u32 = null;
-
+        var lines = std.mem.splitScalar(u8, ps_result.stdout, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \r\n\t");
-
-            // 跳过空行
             if (trimmed.len == 0) continue;
 
-            // 匹配适配器名称（包含"适配器"或"adapter"且以冒号结尾）
-            const has_adapter = std.mem.indexOf(u8, trimmed, "适配器") != null or std.mem.indexOf(u8, trimmed, "adapter") != null;
-            const ends_with_colon = trimmed.len > 0 and trimmed[trimmed.len - 1] == ':';
+            var parts = std.mem.splitScalar(u8, trimmed, '\t');
+            const alias = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+            const description = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+            const ip_text = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+            const prefix_text = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
 
-            if (has_adapter and ends_with_colon) {
-                // 释放之前的名称和描述
-                if (current_name) |old_name| {
-                    allocator.free(old_name);
-                }
-                if (current_description) |old_desc| {
-                    allocator.free(old_desc);
-                }
-                current_name = try allocator.dupe(u8, trimmed);
-                current_description = null; // 重置描述
-                current_ip = null; // 重置 IP
-                current_mask = null; // 重置子网掩码
-            }
+            const ip = parseIpv4Text(ip_text) orelse continue;
+            const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch continue;
+            const name = if (alias.len > 0) alias else description;
+            if (name.len == 0) continue;
 
-            // 匹配描述信息（用于判断虚拟网卡）
-            if (std.mem.indexOf(u8, trimmed, "描述") != null or
-                std.mem.indexOf(u8, trimmed, "Description") != null)
-            {
-                if (std.mem.indexOf(u8, trimmed, ":") != null) {
-                    var parts = std.mem.splitScalar(u8, trimmed, ':');
-                    _ = parts.next();
-                    if (parts.next()) |desc_part| {
-                        const desc_str = std.mem.trim(u8, desc_part, " \r\n\t");
-                        if (desc_str.len > 0) {
-                            if (current_description) |old_desc| {
-                                allocator.free(old_desc);
-                            }
-                            current_description = try allocator.dupe(u8, desc_str);
-                        }
-                    }
-                }
-            }
-
-            // 匹配 IPv4 地址（同时支持中英文）
-            if (std.mem.indexOf(u8, trimmed, "IPv4") != null) {
-                if (std.mem.indexOf(u8, trimmed, ":") != null) {
-                    var parts = std.mem.splitScalar(u8, trimmed, ':');
-                    _ = parts.next(); // 跳过标签
-                    if (parts.next()) |ip_part| {
-                        // 去除空格、括号、"(Preferred)" 等后缀
-                        var ip_str = std.mem.trim(u8, ip_part, " \r\n\t");
-
-                        // 查找括号，截取之前的部分
-                        if (std.mem.indexOf(u8, ip_str, "(")) |paren_pos| {
-                            ip_str = ip_str[0..paren_pos];
-                        }
-
-                        // 解析 IP
-                        var octets: [4]u8 = undefined;
-                        var iter = std.mem.splitScalar(u8, ip_str, '.');
-                        var i: usize = 0;
-                        var valid = true;
-
-                        while (iter.next()) |octet_str| : (i += 1) {
-                            if (i >= 4) {
-                                valid = false;
-                                break;
-                            }
-                            octets[i] = std.fmt.parseUnsigned(u8, octet_str, 10) catch {
-                                valid = false;
-                                break;
-                            };
-                        }
-
-                        if (valid and i == 4) {
-                            current_ip = (@as(u32, octets[0]) << 24) |
-                                (@as(u32, octets[1]) << 16) |
-                                (@as(u32, octets[2]) << 8) |
-                                @as(u32, octets[3]);
-                        }
-                    }
-                }
-            }
-
-            // 匹配子网掩码
-            if (std.mem.indexOf(u8, trimmed, "子网掩码") != null or
-                std.mem.indexOf(u8, trimmed, "Subnet Mask") != null)
-            {
-                if (std.mem.indexOf(u8, trimmed, ":") != null) {
-                    var parts = std.mem.splitScalar(u8, trimmed, ':');
-                    _ = parts.next();
-                    if (parts.next()) |mask_part| {
-                        const mask_str = std.mem.trim(u8, mask_part, " \r\n\t");
-
-                        var octets: [4]u8 = undefined;
-                        var iter = std.mem.splitScalar(u8, mask_str, '.');
-                        var i: usize = 0;
-                        var valid = true;
-
-                        while (iter.next()) |octet_str| : (i += 1) {
-                            if (i >= 4) {
-                                valid = false;
-                                break;
-                            }
-                            octets[i] = std.fmt.parseUnsigned(u8, octet_str, 10) catch {
-                                valid = false;
-                                break;
-                            };
-                        }
-
-                        if (valid and i == 4) {
-                            current_mask = (@as(u32, octets[0]) << 24) |
-                                (@as(u32, octets[1]) << 16) |
-                                (@as(u32, octets[2]) << 8) |
-                                @as(u32, octets[3]);
-
-                            // 当收集到 IP 和掩码后，保存网卡信息
-                            if (current_name != null and current_ip != null and current_mask != null) {
-                                const ip = current_ip.?;
-                                const mask = current_mask.?;
-
-                                // 提取 IP 的各个字节
-                                const ip_octets = [4]u8{
-                                    @intCast((ip >> 24) & 0xFF),
-                                    @intCast((ip >> 16) & 0xFF),
-                                    @intCast((ip >> 8) & 0xFF),
-                                    @intCast(ip & 0xFF),
-                                };
-
-                                // 忽略 127.x.x.x 和 169.254.x.x (APIPA)
-                                if (ip_octets[0] != 127 and !(ip_octets[0] == 169 and ip_octets[1] == 254)) {
-                                    // 计算网络地址和前缀长度
-                                    const network_ip = ip & mask;
-                                    const prefix_len = countMaskBits(mask);
-
-                                    const network_octets = [4]u8{
-                                        @intCast((network_ip >> 24) & 0xFF),
-                                        @intCast((network_ip >> 16) & 0xFF),
-                                        @intCast((network_ip >> 8) & 0xFF),
-                                        @intCast(network_ip & 0xFF),
-                                    };
-
-                                    var cidr_buf: [20]u8 = undefined;
-                                    const cidr = try std.fmt.bufPrint(&cidr_buf, "{d}.{d}.{d}.{d}/{d}", .{ network_octets[0], network_octets[1], network_octets[2], network_octets[3], prefix_len });
-
-                                    // 判断是否为虚拟网卡（优先使用描述，其次使用名称）
-                                    const check_str = if (current_description) |desc| desc else current_name.?;
-                                    const is_virtual = isVirtualAdapter(check_str);
-
-                                    // 保存到列表
-                                    const saved_description = if (current_description) |desc|
-                                        try allocator.dupe(u8, desc)
-                                    else
-                                        try allocator.dupe(u8, current_name.?);
-
-                                    try interfaces.append(allocator, .{
-                                        .name = try allocator.dupe(u8, current_name.?),
-                                        .description = saved_description,
-                                        .ip = ip,
-                                        .cidr = try allocator.dupe(u8, cidr),
-                                        .prefix_len = prefix_len,
-                                        .is_virtual = is_virtual,
-                                    });
-
-                                    // 释放临时保存的适配器名称和描述
-                                    allocator.free(current_name.?);
-                                    if (current_description) |desc| {
-                                        allocator.free(desc);
-                                    }
-                                    current_name = null;
-                                    current_description = null;
-                                    current_ip = null;
-                                    current_mask = null;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 清理未使用的 current_name 和 current_description
-        if (current_name) |name| {
-            allocator.free(name);
-        }
-        if (current_description) |desc| {
-            allocator.free(desc);
+            try appendInterface(allocator, &interfaces, name, description, ip, prefix_len);
         }
     } else {
         // Unix/Linux: 使用 ip addr 或 ifconfig
@@ -1092,7 +979,7 @@ fn printAvailableInterfaces(interfaces: []const NetworkInterface) void {
 }
 
 pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !void {
-    std.debug.print("\n🔍 开始本机子网扫描...\n", .{});
+    std.debug.print("\n🔍 开始当前网卡所在子网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
     const interfaces = try getNetworkInterfaces(allocator);
@@ -1107,7 +994,7 @@ pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !v
         if (iface_filter) |filter| {
             std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
         } else {
-            std.debug.print("❌ 未找到可用于本机子网扫描的网卡\n\n", .{});
+            std.debug.print("❌ 未找到可用于当前网卡所在子网扫描的网卡\n\n", .{});
         }
         printAvailableInterfaces(interfaces);
         return;
@@ -1125,7 +1012,7 @@ pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !v
 }
 
 pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: u16) !void {
-    std.debug.print("\n🔍 开始本机子网端口扫描...\n", .{});
+    std.debug.print("\n🔍 开始当前网卡所在子网端口扫描...\n", .{});
     std.debug.print("目标端口: {d}\n", .{port});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
@@ -1141,7 +1028,7 @@ pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: 
         if (iface_filter) |filter| {
             std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
         } else {
-            std.debug.print("❌ 未找到可用于本机子网扫描的网卡\n\n", .{});
+            std.debug.print("❌ 未找到可用于当前网卡所在子网扫描的网卡\n\n", .{});
         }
         printAvailableInterfaces(interfaces);
         return;
@@ -1158,9 +1045,9 @@ pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: 
     try scanRange(allocator, selected.cidr, port);
 }
 
-/// 扫描局域网（所有网卡的子网）
+/// 扫描所有网卡所在子网
 pub fn discoverLan(allocator: std.mem.Allocator) !void {
-    std.debug.print("\n🔍 开始局域网扫描...\n", .{});
+    std.debug.print("\n🔍 开始所有网卡所在子网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
     const interfaces = try getNetworkInterfaces(allocator);
@@ -1171,7 +1058,7 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    // 智能排序：优先扫描物理网卡的真实局域网
+    // 智能排序：优先扫描物理网卡对应的常见家庭/办公网络子网
     // 判断依据：
     // 1. 网卡名称关键词（is_virtual）- 最可靠
     // 2. IP 地址末位模式 - 辅助判断
@@ -1211,7 +1098,7 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         else blk: {
             const last_octet = @as(u8, @intCast(iface.ip & 0xFF));
             if (last_octet >= 10 and last_octet <= 253) {
-                break :blk "🌟 物理网卡 - 真实局域网";
+                break :blk "🌟 物理网卡 - 常见局域网子网";
             } else if (last_octet == 1) {
                 break :blk "🔧 物理网卡 - 可能是网关";
             } else {
@@ -1273,12 +1160,12 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         total_found += found_hosts.items.len;
     }
 
-    std.debug.print("\n\n📊 局域网扫描完成: 总计发现 {d} 个活跃主机\n", .{total_found});
+    std.debug.print("\n\n📊 所有网卡所在子网扫描完成: 总计发现 {d} 个活跃主机\n", .{total_found});
 }
 
-/// 扫描局域网端口
+/// 扫描所有网卡所在子网的端口
 pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
-    std.debug.print("\n🔍 开始局域网端口扫描...\n", .{});
+    std.debug.print("\n🔍 开始所有网卡所在子网端口扫描...\n", .{});
     std.debug.print("目标端口: {d}\n", .{port});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
@@ -1336,5 +1223,5 @@ pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
         total_found += found;
     }
 
-    std.debug.print("\n\n📊 局域网扫描完成: 总计发现 {d} 个开放端口的主机\n", .{total_found});
+    std.debug.print("\n\n📊 所有网卡所在子网端口扫描完成: 总计发现 {d} 个开放端口的主机\n", .{total_found});
 }

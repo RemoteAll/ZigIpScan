@@ -46,9 +46,9 @@ zig build run
 ```text
 === Zig IP Scan 交互式菜单 ===
 请选择扫描模式:
-  1) 本机子网 (local)    # 自动检测网卡,扫描本机所在子网
+  1) 当前网卡所在子网 (local)    # 自动检测并选择一个网卡,扫描该网卡所在子网
   2) 指定CIDR (cidr)     # 手动输入网段,如 192.168.1.0/24
-  3) 局域网 (lan)         # 扫描所有网卡的子网
+  3) 所有网卡所在子网 (lan)     # 扫描所有检测到的网卡子网
 ```
 
 ### 2. 命令行模式
@@ -59,8 +59,8 @@ zig build run
 # 主机发现(默认行为)
 zig build run -- --mode cidr --cidr 192.168.1.0/24
 zig build run -- --mode cidr --cidr 2001:db8::/120     # IPv6
-zig build run -- --mode local                          # 本机子网,自动检测
-zig build run -- --mode lan                            # 局域网全扫描
+zig build run -- --mode local                          # 当前网卡所在子网,自动检测并选择一个网卡
+zig build run -- --mode lan                            # 所有网卡所在子网全扫描
 
 # 端口扫描(需要 --action scan)
 zig build run -- --mode cidr --cidr 192.168.1.0/24 --action scan --port 80
@@ -70,9 +70,9 @@ zig build run -- --mode local --action scan --port 443
 #### 参数说明
 
 - **`--mode <模式>`**: 扫描范围
-  - `local`: 本机子网(自动检测网卡,无需手动指定)
+  - `local`: 当前网卡所在子网(自动检测并选择一个网卡,可配合 `--iface` 筛选)
   - `cidr`: 指定 CIDR 网段(需配合 `--cidr`)
-  - `lan`: 局域网(所有活动网卡)
+  - `lan`: 所有网卡所在子网(扫描所有活动网卡)
 
 - **`--action <操作>`**: 操作类型(可选,默认 `discover`)
   - `discover`: 主机发现(不扫描端口)
@@ -97,7 +97,7 @@ zig build run -- --mode local --action scan --port 443
 - ✅ 命令行参数解析
 - ✅ zzig 依赖集成
 - ✅ 跨平台 stdin/stdout 支持
-- ✅ 本机子网自动选取网卡
+- ✅ 当前网卡所在子网自动选取网卡
 - ✅ 可通过 --iface 按名称/描述/CIDR 筛选本机网卡
 - 🚧 CIDR 解析与 IP 枚举(待实现)
 - 🚧 TCP 连通性检测(待实现)

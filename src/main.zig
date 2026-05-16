@@ -12,6 +12,10 @@ fn printUsage() void {
             "  --mode local|cidr|lan\n" ++
             "  --action discover|scan (默认 discover)\n" ++
             "  --cidr <网段>  --port <端口>  --iface <网卡名>\n" ++
+            "模式含义:\n" ++
+            "  local: 当前网卡所在子网\n" ++
+            "  cidr: 指定 CIDR 网段\n" ++
+            "  lan: 所有网卡所在子网\n" ++
             "示例:\n  zig build run -- --mode cidr --cidr 192.168.1.0/24\n",
         .{},
     );
@@ -36,9 +40,9 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
 
     // 第二步: 选择扫描模式
     std.debug.print("\n请选择扫描范围:\n", .{});
-    std.debug.print("  1) 本机子网 (local) - 自动检测网卡\n", .{});
+    std.debug.print("  1) 当前网卡所在子网 (local) - 自动检测并选择一个网卡\n", .{});
     std.debug.print("  2) 指定网段 (cidr) - 手动输入 CIDR\n", .{});
-    std.debug.print("  3) 局域网 (lan) - 所有网卡的子网\n", .{});
+    std.debug.print("  3) 所有网卡所在子网 (lan) - 扫描全部检测到的网卡子网\n", .{});
     std.debug.print("输入序号: ", .{});
 
     const mode_input = zzig.Menu.readLine(allocator) catch |err| {
@@ -100,10 +104,10 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
         }
     } else if (std.mem.eql(u8, mode, "local")) {
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 本机子网", .{});
+            std.log.info("主机发现 当前网卡所在子网", .{});
             try Scan.discoverLocal(allocator, null);
         } else {
-            std.log.info("端口扫描 本机子网, port={d}", .{port});
+            std.log.info("端口扫描 当前网卡所在子网, port={d}", .{port});
             try Scan.scanLocal(allocator, null, port);
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
@@ -185,10 +189,10 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (std.mem.eql(u8, mode, "local")) {
         if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 本机子网 (iface={s})", .{iface});
+            std.log.info("主机发现 当前网卡所在子网 (iface={s})", .{iface});
             try Scan.discoverLocal(allocator, if (iface.len > 0) iface else null);
         } else {
-            std.log.info("端口扫描 本机子网 (iface={s}), port={d}", .{ iface, port });
+            std.log.info("端口扫描 当前网卡所在子网 (iface={s}), port={d}", .{ iface, port });
             try Scan.scanLocal(allocator, if (iface.len > 0) iface else null, port);
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
