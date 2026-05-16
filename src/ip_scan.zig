@@ -86,14 +86,7 @@ fn discoverRangeWithPriority(allocator: std.mem.Allocator, cidr: []const u8, loc
         .progress_interval_ms = 500,
         .progress_callback = printArpScanProgress,
     });
-    defer {
-        for (found_hosts.items) |host| {
-            if (host.hostname) |name| {
-                allocator.free(name);
-            }
-        }
-        found_hosts.deinit(allocator);
-    }
+    defer znet.freeHostInfos(allocator, &found_hosts);
 
     const total_time = @divFloor(compat.milliTimestamp() - start_time, 1000);
     const avg_speed = if (total_time > 0) @divFloor(cidr_info.host_count, @as(usize, @intCast(total_time))) else 0;
@@ -134,12 +127,48 @@ pub fn discoverRange(allocator: std.mem.Allocator, cidr: []const u8) !void {
 const NetworkInterface = znet.NetworkInterface;
 const RankedNetworkInterface = znet.RankedNetworkInterface;
 const InterfaceSelectionResult = znet.InterfaceSelectionResult;
+const RankedInterfacesResult = znet.RankedInterfacesResult;
 
 fn printAvailableInterfaces(interfaces: []const NetworkInterface) void {
     std.debug.print("可用网卡:\n", .{});
     for (interfaces) |iface| {
         std.debug.print("  • {s}  [{s}]\n", .{ iface.cidr, iface.name });
         std.debug.print("    描述: {s}\n", .{iface.description});
+    }
+}
+
+fn printInterfaceSelectionFailure(interfaces: []const NetworkInterface, iface_filter: ?[]const u8) void {
+    if (iface_filter) |filter| {
+        std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
+    } else {
+        std.debug.print("❌ 未找到可用于当前网卡所在子网扫描的网卡\n\n", .{});
+    }
+    printAvailableInterfaces(interfaces);
+}
+
+fn printSelectedInterface(selected: NetworkInterface) !void {
+    var ip_buf: [16]u8 = undefined;
+    const ip_str = try znet.ipToString(selected.ip, &ip_buf);
+    std.debug.print("已选择网卡:\n", .{});
+    std.debug.print("  名称: {s}\n", .{selected.name});
+    std.debug.print("  描述: {s}\n", .{selected.description});
+    std.debug.print("  本机 IP: {s}\n", .{ip_str});
+    std.debug.print("  子网: {s}\n\n", .{selected.cidr});
+}
+
+fn printRankedInterfaces(sorted_interfaces: []const RankedNetworkInterface, verbose: bool) !void {
+    std.debug.print("检测到 {d} 个网卡（已智能排序）:\n", .{sorted_interfaces.len});
+    for (sorted_interfaces) |item| {
+        const iface = item.iface;
+        if (!verbose) {
+            std.debug.print("  • {s}\n", .{iface.cidr});
+            continue;
+        }
+
+        var ip_buf: [16]u8 = undefined;
+        const ip_str = try znet.ipToString(iface.ip, &ip_buf);
+        std.debug.print("  • {s} - {s}\n", .{ iface.cidr, znet.getInterfaceTag(iface) });
+        std.debug.print("    本机 IP: {s}, 优先级: {d}\n", .{ ip_str, item.priority });
     }
 }
 
@@ -158,22 +187,11 @@ pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !v
     }
 
     const selected = selection.selected orelse {
-        if (iface_filter) |filter| {
-            std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
-        } else {
-            std.debug.print("❌ 未找到可用于当前网卡所在子网扫描的网卡\n\n", .{});
-        }
-        printAvailableInterfaces(interfaces);
+        printInterfaceSelectionFailure(interfaces, iface_filter);
         return;
     };
 
-    var ip_buf: [16]u8 = undefined;
-    const ip_str = try znet.ipToString(selected.ip, &ip_buf);
-    std.debug.print("已选择网卡:\n", .{});
-    std.debug.print("  名称: {s}\n", .{selected.name});
-    std.debug.print("  描述: {s}\n", .{selected.description});
-    std.debug.print("  本机 IP: {s}\n", .{ip_str});
-    std.debug.print("  子网: {s}\n\n", .{selected.cidr});
+    try printSelectedInterface(selected);
 
     try discoverRangeWithPriority(allocator, selected.cidr, selected.ip);
 }
@@ -194,22 +212,11 @@ pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: 
     }
 
     const selected = selection.selected orelse {
-        if (iface_filter) |filter| {
-            std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
-        } else {
-            std.debug.print("❌ 未找到可用于当前网卡所在子网扫描的网卡\n\n", .{});
-        }
-        printAvailableInterfaces(interfaces);
+        printInterfaceSelectionFailure(interfaces, iface_filter);
         return;
     };
 
-    var ip_buf: [16]u8 = undefined;
-    const ip_str = try znet.ipToString(selected.ip, &ip_buf);
-    std.debug.print("已选择网卡:\n", .{});
-    std.debug.print("  名称: {s}\n", .{selected.name});
-    std.debug.print("  描述: {s}\n", .{selected.description});
-    std.debug.print("  本机 IP: {s}\n", .{ip_str});
-    std.debug.print("  子网: {s}\n\n", .{selected.cidr});
+    try printSelectedInterface(selected);
 
     try scanRange(allocator, selected.cidr, port);
 }
@@ -219,40 +226,19 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
     std.debug.print("\n🔍 开始所有网卡所在子网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try znet.getNetworkInterfaces(allocator);
-    defer znet.freeNetworkInterfaces(allocator, interfaces);
+    const ranked_result: RankedInterfacesResult = try znet.getRankedSystemInterfaces(allocator);
+    defer ranked_result.deinit(allocator);
+
+    const interfaces = ranked_result.interfaces;
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    const sorted_interfaces: []RankedNetworkInterface = try znet.rankInterfacesByPriority(allocator, interfaces);
-    defer allocator.free(sorted_interfaces);
+    const sorted_interfaces: []const RankedNetworkInterface = ranked_result.ranked;
 
-    std.debug.print("检测到 {d} 个网卡（已智能排序）:\n", .{interfaces.len});
-    for (sorted_interfaces) |item| {
-        const iface = item.iface;
-        var ip_buf: [16]u8 = undefined;
-        const ip_str = try znet.ipToString(iface.ip, &ip_buf);
-
-        // 生成更准确的标签
-        const tag = if (iface.is_virtual)
-            "⚙️  虚拟网卡"
-        else blk: {
-            const last_octet = @as(u8, @intCast(iface.ip & 0xFF));
-            if (last_octet >= 10 and last_octet <= 253) {
-                break :blk "🌟 物理网卡 - 常见局域网子网";
-            } else if (last_octet == 1) {
-                break :blk "🔧 物理网卡 - 可能是网关";
-            } else {
-                break :blk "📡 物理网卡";
-            }
-        };
-
-        std.debug.print("  • {s} - {s}\n", .{ iface.cidr, tag });
-        std.debug.print("    本机 IP: {s}, 优先级: {d}\n", .{ ip_str, item.priority });
-    }
+    try printRankedInterfaces(sorted_interfaces, true);
 
     std.debug.print("\n开始扫描...\n", .{});
 
@@ -278,14 +264,7 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
             .progress_interval_ms = 500,
             .progress_callback = printArpScanProgress,
         });
-        defer {
-            for (found_hosts.items) |host| {
-                if (host.hostname) |name| {
-                    allocator.free(name);
-                }
-            }
-            found_hosts.deinit(allocator);
-        }
+        defer znet.freeHostInfos(allocator, &found_hosts);
 
         const total_time = @divFloor(compat.milliTimestamp() - start_time, 1000);
         const avg_speed = if (total_time > 0) @divFloor(cidr_info.host_count, @as(usize, @intCast(total_time))) else 0;
@@ -324,21 +303,19 @@ pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
     std.debug.print("目标端口: {d}\n", .{port});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try znet.getNetworkInterfaces(allocator);
-    defer znet.freeNetworkInterfaces(allocator, interfaces);
+    const ranked_result: RankedInterfacesResult = try znet.getRankedSystemInterfaces(allocator);
+    defer ranked_result.deinit(allocator);
+
+    const interfaces = ranked_result.interfaces;
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    const sorted_interfaces: []RankedNetworkInterface = try znet.rankInterfacesByPriority(allocator, interfaces);
-    defer allocator.free(sorted_interfaces);
+    const sorted_interfaces: []const RankedNetworkInterface = ranked_result.ranked;
 
-    std.debug.print("检测到 {d} 个网卡（已智能排序）:\n", .{interfaces.len});
-    for (sorted_interfaces) |item| {
-        std.debug.print("  • {s}\n", .{item.iface.cidr});
-    }
+    try printRankedInterfaces(sorted_interfaces, true);
 
     std.debug.print("\n开始扫描...\n", .{});
 
