@@ -2,6 +2,46 @@ const std = @import("std");
 const Scan = @import("ip_scan.zig");
 const zzig = @import("zzig");
 
+fn executeScanMode(allocator: std.mem.Allocator, mode: []const u8, action: []const u8, cidr: []const u8, iface: ?[]const u8, port: u16, announce: bool) !void {
+    if (std.mem.eql(u8, mode, "cidr")) {
+        if (cidr.len == 0) return error.InvalidArguments;
+
+        if (std.mem.eql(u8, action, "discover")) {
+            if (announce) std.log.info("主机发现 CIDR={s}", .{cidr});
+            try Scan.discoverRange(allocator, cidr);
+        } else {
+            if (announce) std.log.info("端口扫描 CIDR={s}, port={d}", .{ cidr, port });
+            try Scan.scanRange(allocator, cidr, port);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "local")) {
+        const iface_value = iface orelse "";
+        const iface_filter = if (iface_value.len > 0) iface_value else null;
+
+        if (std.mem.eql(u8, action, "discover")) {
+            if (announce) std.log.info("主机发现 当前网卡所在子网 (iface={s})", .{iface_value});
+            try Scan.discoverLocal(allocator, iface_filter);
+        } else {
+            if (announce) std.log.info("端口扫描 当前网卡所在子网 (iface={s}), port={d}", .{ iface_value, port });
+            try Scan.scanLocal(allocator, iface_filter, port);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "lan")) {
+        if (std.mem.eql(u8, action, "discover")) {
+            try Scan.discoverLan(allocator);
+        } else {
+            try Scan.scanLan(allocator, port);
+        }
+        return;
+    }
+
+    return error.InvalidMode;
+}
+
 fn printUsage() void {
     std.log.info(
         "zig-ip-scan\n" ++
@@ -93,30 +133,9 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print("\n开始执行...\n", .{});
+    defer if (cidr_buf.len > 0) allocator.free(cidr_buf);
 
-    // 执行逻辑
-    if (std.mem.eql(u8, mode, "cidr")) {
-        defer allocator.free(cidr_buf);
-        if (std.mem.eql(u8, action, "discover")) {
-            try Scan.discoverRange(allocator, cidr_buf);
-        } else {
-            try Scan.scanRange(allocator, cidr_buf, port);
-        }
-    } else if (std.mem.eql(u8, mode, "local")) {
-        if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 当前网卡所在子网", .{});
-            try Scan.discoverLocal(allocator, null);
-        } else {
-            std.log.info("端口扫描 当前网卡所在子网, port={d}", .{port});
-            try Scan.scanLocal(allocator, null, port);
-        }
-    } else if (std.mem.eql(u8, mode, "lan")) {
-        if (std.mem.eql(u8, action, "discover")) {
-            try Scan.discoverLan(allocator);
-        } else {
-            try Scan.scanLan(allocator, port);
-        }
-    }
+    try executeScanMode(allocator, mode, action, cidr_buf, null, port, false);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -175,37 +194,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, mode, "cidr")) {
-        if (cidr.len == 0) {
+    executeScanMode(allocator, mode, action, cidr, if (iface.len > 0) iface else null, port, true) catch |err| switch (err) {
+        error.InvalidArguments => {
             std.log.err("CIDR 模式需要 --cidr", .{});
             return;
-        }
-        if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 CIDR={s}", .{cidr});
-            try Scan.discoverRange(allocator, cidr);
-        } else {
-            std.log.info("端口扫描 CIDR={s}, port={d}", .{ cidr, port });
-            try Scan.scanRange(allocator, cidr, port);
-        }
-    } else if (std.mem.eql(u8, mode, "local")) {
-        if (std.mem.eql(u8, action, "discover")) {
-            std.log.info("主机发现 当前网卡所在子网 (iface={s})", .{iface});
-            try Scan.discoverLocal(allocator, if (iface.len > 0) iface else null);
-        } else {
-            std.log.info("端口扫描 当前网卡所在子网 (iface={s}), port={d}", .{ iface, port });
-            try Scan.scanLocal(allocator, if (iface.len > 0) iface else null, port);
-        }
-    } else if (std.mem.eql(u8, mode, "lan")) {
-        if (std.mem.eql(u8, action, "discover")) {
-            try Scan.discoverLan(allocator);
-        } else {
-            try Scan.scanLan(allocator, port);
-        }
-    } else {
-        std.log.err("不支持的模式: {s}", .{mode});
-        printUsage();
-        return;
-    }
+        },
+        error.InvalidMode => {
+            std.log.err("不支持的模式: {s}", .{mode});
+            printUsage();
+            return;
+        },
+        else => return err,
+    };
 
     std.log.info("执行结束", .{});
 }
