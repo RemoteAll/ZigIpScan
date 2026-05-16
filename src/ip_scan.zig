@@ -3,32 +3,6 @@ const zzig = @import("zzig");
 const compat = zzig.compat;
 const znet = zzig.Net;
 
-/// CIDR 信息结构
-const CidrInfo = znet.CidrInfo;
-
-/// 解析 IPv4 CIDR 格式（如 "192.168.1.0/24"）
-fn parseCidr(cidr: []const u8) !CidrInfo {
-    return znet.parseCidr(cidr);
-}
-
-/// 主机信息结构
-const HostInfo = znet.HostInfo;
-
-/// 将 u32 IP 转换为字符串（主机字节序）
-fn ipToString(ip: u32, buf: []u8) ![]u8 {
-    return znet.ipToString(ip, buf);
-}
-
-/// 格式化 MAC 地址为字符串
-fn macToString(mac: [6]u8, buf: []u8) ![]u8 {
-    return znet.macToString(mac, buf);
-}
-
-/// 测试 TCP 端口连通性
-fn testTcpPort(ip_str: []const u8, port: u16, timeout_ms: u32) bool {
-    return znet.testTcpPort(std.heap.page_allocator, ip_str, port, timeout_ms);
-}
-
 fn printArpScanProgress(_: ?*anyopaque, progress: znet.ArpScanProgress) void {
     if (progress.total == 0 or progress.completed >= progress.total) return;
 
@@ -55,11 +29,11 @@ pub fn scanRange(allocator: std.mem.Allocator, cidr: []const u8, port: u16) !voi
     std.debug.print("\n🔍 开始端口扫描...\n", .{});
     std.debug.print("目标: {s}  端口: {d}\n\n", .{ cidr, port });
 
-    const cidr_info = try parseCidr(cidr);
+    const cidr_info = try znet.parseCidr(cidr);
 
     std.debug.print("网段信息:\n", .{});
     var buf: [16]u8 = undefined;
-    const base_str = try ipToString(cidr_info.base_ip, &buf);
+    const base_str = try znet.ipToString(cidr_info.base_ip, &buf);
     std.debug.print("  网络地址: {s}/{d}\n", .{ base_str, cidr_info.prefix_len });
     std.debug.print("  可扫描主机数: {d}\n\n", .{cidr_info.host_count});
 
@@ -76,7 +50,7 @@ pub fn scanRange(allocator: std.mem.Allocator, cidr: []const u8, port: u16) !voi
 
     for (found_ips.items) |ip| {
         var ip_buf: [16]u8 = undefined;
-        const ip_str = try ipToString(ip, &ip_buf);
+        const ip_str = try znet.ipToString(ip, &ip_buf);
         std.debug.print("✓ {s}  端口 {d} 开放\n", .{ ip_str, port });
     }
 
@@ -87,11 +61,11 @@ fn discoverRangeWithPriority(allocator: std.mem.Allocator, cidr: []const u8, loc
     std.debug.print("\n🔍 开始主机发现...\n", .{});
     std.debug.print("目标: {s}\n\n", .{cidr});
 
-    const cidr_info = try parseCidr(cidr);
+    const cidr_info = try znet.parseCidr(cidr);
 
     std.debug.print("网段信息:\n", .{});
     var buf: [16]u8 = undefined;
-    const base_str = try ipToString(cidr_info.base_ip, &buf);
+    const base_str = try znet.ipToString(cidr_info.base_ip, &buf);
     std.debug.print("  网络地址: {s}/{d}\n", .{ base_str, cidr_info.prefix_len });
     std.debug.print("  可扫描主机数: {d}\n", .{cidr_info.host_count});
 
@@ -136,10 +110,10 @@ fn discoverRangeWithPriority(allocator: std.mem.Allocator, cidr: []const u8, loc
 
         for (found_hosts.items) |host| {
             var ip_buf: [16]u8 = undefined;
-            const ip_str = try ipToString(host.ip, &ip_buf);
+            const ip_str = try znet.ipToString(host.ip, &ip_buf);
 
             var mac_buf: [18]u8 = undefined;
-            const mac_str = try macToString(host.mac, &mac_buf);
+            const mac_str = try znet.macToString(host.mac, &mac_buf);
 
             if (host.hostname) |hostname_str| {
                 std.debug.print("{s:<16}  {s:<18}  {s}\n", .{ ip_str, mac_str, hostname_str });
@@ -158,23 +132,8 @@ pub fn discoverRange(allocator: std.mem.Allocator, cidr: []const u8) !void {
 
 /// 网卡信息结构
 const NetworkInterface = znet.NetworkInterface;
-
-/// 获取本机所有网卡信息
-fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
-    return znet.getNetworkInterfaces(allocator);
-}
-
-fn freeNetworkInterfaces(allocator: std.mem.Allocator, interfaces: []const NetworkInterface) void {
-    znet.freeNetworkInterfaces(allocator, interfaces);
-}
-
-fn getInterfacePriority(iface: NetworkInterface) u8 {
-    return znet.getInterfacePriority(iface);
-}
-
-fn findPreferredInterface(interfaces: []const NetworkInterface, iface_filter: ?[]const u8) ?NetworkInterface {
-    return znet.selectBestInterface(interfaces, iface_filter);
-}
+const RankedNetworkInterface = znet.RankedNetworkInterface;
+const InterfaceSelectionResult = znet.InterfaceSelectionResult;
 
 fn printAvailableInterfaces(interfaces: []const NetworkInterface) void {
     std.debug.print("可用网卡:\n", .{});
@@ -188,15 +147,17 @@ pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !v
     std.debug.print("\n🔍 开始当前网卡所在子网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try getNetworkInterfaces(allocator);
-    defer freeNetworkInterfaces(allocator, interfaces);
+    const selection: InterfaceSelectionResult = try znet.selectSystemInterface(allocator, iface_filter);
+    defer selection.deinit(allocator);
+
+    const interfaces = selection.interfaces;
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    const selected = findPreferredInterface(interfaces, iface_filter) orelse {
+    const selected = selection.selected orelse {
         if (iface_filter) |filter| {
             std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
         } else {
@@ -207,7 +168,7 @@ pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !v
     };
 
     var ip_buf: [16]u8 = undefined;
-    const ip_str = try ipToString(selected.ip, &ip_buf);
+    const ip_str = try znet.ipToString(selected.ip, &ip_buf);
     std.debug.print("已选择网卡:\n", .{});
     std.debug.print("  名称: {s}\n", .{selected.name});
     std.debug.print("  描述: {s}\n", .{selected.description});
@@ -222,15 +183,17 @@ pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: 
     std.debug.print("目标端口: {d}\n", .{port});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try getNetworkInterfaces(allocator);
-    defer freeNetworkInterfaces(allocator, interfaces);
+    const selection: InterfaceSelectionResult = try znet.selectSystemInterface(allocator, iface_filter);
+    defer selection.deinit(allocator);
+
+    const interfaces = selection.interfaces;
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    const selected = findPreferredInterface(interfaces, iface_filter) orelse {
+    const selected = selection.selected orelse {
         if (iface_filter) |filter| {
             std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
         } else {
@@ -241,7 +204,7 @@ pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: 
     };
 
     var ip_buf: [16]u8 = undefined;
-    const ip_str = try ipToString(selected.ip, &ip_buf);
+    const ip_str = try znet.ipToString(selected.ip, &ip_buf);
     std.debug.print("已选择网卡:\n", .{});
     std.debug.print("  名称: {s}\n", .{selected.name});
     std.debug.print("  描述: {s}\n", .{selected.description});
@@ -256,47 +219,22 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
     std.debug.print("\n🔍 开始所有网卡所在子网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try getNetworkInterfaces(allocator);
-    defer freeNetworkInterfaces(allocator, interfaces);
+    const interfaces = try znet.getNetworkInterfaces(allocator);
+    defer znet.freeNetworkInterfaces(allocator, interfaces);
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    // 智能排序：优先扫描物理网卡对应的常见家庭/办公网络子网
-    // 判断依据：
-    // 1. 网卡名称关键词（is_virtual）- 最可靠
-    // 2. IP 地址末位模式 - 辅助判断
-    // 3. 子网掩码大小 - 虚拟网卡常用较大子网
-    const InterfaceWithPriority = struct {
-        iface: NetworkInterface,
-        priority: u8,
-    };
-
-    var sorted_interfaces = try allocator.alloc(InterfaceWithPriority, interfaces.len);
+    const sorted_interfaces: []RankedNetworkInterface = try znet.rankInterfacesByPriority(allocator, interfaces);
     defer allocator.free(sorted_interfaces);
-
-    for (interfaces, 0..) |iface, i| {
-        sorted_interfaces[i] = .{ .iface = iface, .priority = getInterfacePriority(iface) };
-    }
-
-    // 按优先级排序（冒泡排序）
-    for (0..sorted_interfaces.len) |i| {
-        for (i + 1..sorted_interfaces.len) |j| {
-            if (sorted_interfaces[i].priority > sorted_interfaces[j].priority) {
-                const temp = sorted_interfaces[i];
-                sorted_interfaces[i] = sorted_interfaces[j];
-                sorted_interfaces[j] = temp;
-            }
-        }
-    }
 
     std.debug.print("检测到 {d} 个网卡（已智能排序）:\n", .{interfaces.len});
     for (sorted_interfaces) |item| {
         const iface = item.iface;
         var ip_buf: [16]u8 = undefined;
-        const ip_str = try ipToString(iface.ip, &ip_buf);
+        const ip_str = try znet.ipToString(iface.ip, &ip_buf);
 
         // 生成更准确的标签
         const tag = if (iface.is_virtual)
@@ -324,7 +262,7 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         const iface = item.iface;
         std.debug.print("\n[{d}/{d}] 扫描网段: {s}\n", .{ idx + 1, interfaces.len, iface.cidr });
 
-        const cidr_info = try parseCidr(iface.cidr);
+        const cidr_info = try znet.parseCidr(iface.cidr);
 
         // ARP 扫描速度估算
         const thread_count: usize = 64;
@@ -359,10 +297,10 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
         if (found_hosts.items.len > 0) {
             for (found_hosts.items) |host| {
                 var ip_buf: [16]u8 = undefined;
-                const ip_str = try ipToString(host.ip, &ip_buf);
+                const ip_str = try znet.ipToString(host.ip, &ip_buf);
 
                 var mac_buf: [18]u8 = undefined;
-                const mac_str = try macToString(host.mac, &mac_buf);
+                const mac_str = try znet.macToString(host.mac, &mac_buf);
 
                 const hostname_str = host.hostname orelse "";
                 if (hostname_str.len > 0) {
@@ -386,27 +324,31 @@ pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
     std.debug.print("目标端口: {d}\n", .{port});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
-    const interfaces = try getNetworkInterfaces(allocator);
-    defer freeNetworkInterfaces(allocator, interfaces);
+    const interfaces = try znet.getNetworkInterfaces(allocator);
+    defer znet.freeNetworkInterfaces(allocator, interfaces);
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
         return;
     }
 
-    std.debug.print("检测到 {d} 个网卡:\n", .{interfaces.len});
-    for (interfaces) |iface| {
-        std.debug.print("  • {s}\n", .{iface.cidr});
+    const sorted_interfaces: []RankedNetworkInterface = try znet.rankInterfacesByPriority(allocator, interfaces);
+    defer allocator.free(sorted_interfaces);
+
+    std.debug.print("检测到 {d} 个网卡（已智能排序）:\n", .{interfaces.len});
+    for (sorted_interfaces) |item| {
+        std.debug.print("  • {s}\n", .{item.iface.cidr});
     }
 
     std.debug.print("\n开始扫描...\n", .{});
 
     var total_found: usize = 0;
 
-    for (interfaces, 0..) |iface, idx| {
+    for (sorted_interfaces, 0..) |item, idx| {
+        const iface = item.iface;
         std.debug.print("\n[{d}/{d}] 扫描网段: {s}\n", .{ idx + 1, interfaces.len, iface.cidr });
 
-        const cidr_info = try parseCidr(iface.cidr);
+        const cidr_info = try znet.parseCidr(iface.cidr);
 
         // 显示预估时间
         const estimated_seconds = (cidr_info.host_count * 200) / 1000;
@@ -422,7 +364,7 @@ pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
         for (found_ips.items) |ip| {
             std.debug.print("                                                    \r", .{});
             var ip_buf: [16]u8 = undefined;
-            const ip_str = try ipToString(ip, &ip_buf);
+            const ip_str = try znet.ipToString(ip, &ip_buf);
             std.debug.print("  ✓ {s}  端口 {d} 开放\n", .{ ip_str, port });
         }
 
