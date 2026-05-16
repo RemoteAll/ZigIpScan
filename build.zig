@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const release_min = optimize != .Debug;
 
     // 获取 zzig 依赖
     const zzig = b.dependency("zzig", .{
@@ -16,6 +17,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = release_min,
+            .omit_frame_pointer = release_min,
         }),
     });
 
