@@ -17,38 +17,7 @@ fn printUsage() void {
     );
 }
 
-/// 简单的交互式读取行输入
-/// 适用于 Zig 0.15.2
-fn readLineSimple(allocator: std.mem.Allocator) ![]u8 {
-    const builtin = @import("builtin");
-
-    var buffer: [4096]u8 = undefined;
-    const bytes_read = if (builtin.os.tag == .windows) blk: {
-        const w = std.os.windows;
-        const stdin_handle = w.kernel32.GetStdHandle(w.STD_INPUT_HANDLE) orelse return error.InvalidHandle;
-        if (stdin_handle == w.INVALID_HANDLE_VALUE) return error.InvalidHandle;
-
-        var bytes: w.DWORD = 0;
-        if (w.kernel32.ReadFile(stdin_handle, &buffer, buffer.len, &bytes, null) == 0) {
-            return error.ReadFailed;
-        }
-        break :blk @as(usize, bytes);
-    } else blk: {
-        break :blk try std.posix.read(std.posix.STDIN_FILENO, &buffer);
-    };
-
-    if (bytes_read == 0) return error.EndOfStream;
-
-    // 去除换行符
-    const line = buffer[0..bytes_read];
-    const trimmed = std.mem.trimRight(u8, line, &[_]u8{ '\r', '\n' });
-    return try allocator.dupe(u8, trimmed);
-}
-
 fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
-    // 初始化控制台支持中文和颜色
-    _ = zzig.Console.init(.{});
-
     std.debug.print("\n=== Zig IP Scan 交互式菜单 ===\n", .{});
 
     // 第一步: 选择操作类型
@@ -57,7 +26,10 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     std.debug.print("  2) 端口扫描 (scan) - 检测端口开放情况\n", .{});
     std.debug.print("输入序号 (默认 1): ", .{});
 
-    const action_input = readLineSimple(allocator) catch "";
+    const action_input = zzig.Menu.readLine(allocator) catch |err| switch (err) {
+        error.EndOfStream => try allocator.dupe(u8, ""),
+        else => return err,
+    };
     defer if (action_input.len > 0) allocator.free(action_input);
 
     const action = if (std.mem.eql(u8, action_input, "2")) "scan" else "discover";
@@ -69,7 +41,7 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     std.debug.print("  3) 局域网 (lan) - 所有网卡的子网\n", .{});
     std.debug.print("输入序号: ", .{});
 
-    const mode_input = readLineSimple(allocator) catch |err| {
+    const mode_input = zzig.Menu.readLine(allocator) catch |err| {
         std.log.err("读取输入失败: {}", .{err});
         return;
     };
@@ -92,7 +64,7 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
 
     if (std.mem.eql(u8, mode, "cidr")) {
         std.debug.print("\n请输入 CIDR (如 192.168.1.0/24 或 2001:db8::/120): ", .{});
-        cidr_buf = try readLineSimple(allocator);
+        cidr_buf = try zzig.Menu.readLine(allocator);
         if (cidr_buf.len == 0) {
             std.log.err("CIDR 不能为空", .{});
             return;
@@ -106,7 +78,10 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     // 第四步: 如果是端口扫描,获取端口号
     if (std.mem.eql(u8, action, "scan")) {
         std.debug.print("\n请输入端口 (默认 80): ", .{});
-        const port_input = readLineSimple(allocator) catch "";
+        const port_input = zzig.Menu.readLine(allocator) catch |err| switch (err) {
+            error.EndOfStream => try allocator.dupe(u8, ""),
+            else => return err,
+        };
         defer if (port_input.len > 0) allocator.free(port_input);
         if (port_input.len > 0) {
             port = std.fmt.parseUnsigned(u16, port_input, 10) catch 80;
@@ -126,16 +101,10 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     } else if (std.mem.eql(u8, mode, "local")) {
         if (std.mem.eql(u8, action, "discover")) {
             std.log.info("主机发现 本机子网", .{});
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 自动检测本机活跃网卡\n", .{});
-            std.debug.print("  - 获取网卡 IP 和子网掩码\n", .{});
-            std.debug.print("  - 计算 CIDR 网段\n", .{});
-            std.debug.print("  - 扫描同子网的活跃主机\n", .{});
+            try Scan.discoverLocal(allocator, null);
         } else {
             std.log.info("端口扫描 本机子网, port={d}", .{port});
-            std.debug.print("\n🚧 [开发中] 将实现:\n", .{});
-            std.debug.print("  - 自动检测本机活跃网卡\n", .{});
-            std.debug.print("  - 扫描同子网的端口 {} 开放情况\n", .{port});
+            try Scan.scanLocal(allocator, null, port);
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
         if (std.mem.eql(u8, action, "discover")) {
@@ -146,13 +115,12 @@ fn runInteractiveMenu(allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    zzig.compat.setCurrentIo(init.io);
+    _ = zzig.Console.init(.{});
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len == 1) {
         // 无参数时进入交互式菜单
@@ -218,10 +186,10 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, mode, "local")) {
         if (std.mem.eql(u8, action, "discover")) {
             std.log.info("主机发现 本机子网 (iface={s})", .{iface});
-            // TODO: 列举本机网卡并解析子网，调用 Scan.discoverRange
+            try Scan.discoverLocal(allocator, if (iface.len > 0) iface else null);
         } else {
             std.log.info("端口扫描 本机子网 (iface={s}), port={d}", .{ iface, port });
-            // TODO: 列举本机网卡并解析子网，调用 Scan.scanRange
+            try Scan.scanLocal(allocator, if (iface.len > 0) iface else null, port);
         }
     } else if (std.mem.eql(u8, mode, "lan")) {
         if (std.mem.eql(u8, action, "discover")) {

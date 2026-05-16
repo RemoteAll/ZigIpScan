@@ -1,6 +1,6 @@
 # Zig IP Scan
 
-一个使用 Zig 0.15.2+ 开发的 IP 扫描工具,支持主机发现和端口扫描。提供交互式菜单和命令行两种使用方式。
+一个使用 Zig 0.16.0+ 开发的 IP 扫描工具,支持主机发现和端口扫描。提供交互式菜单和命令行两种使用方式。
 
 ## 特性
 
@@ -12,9 +12,12 @@
 - 🚧 端口扫描:TCP 连通性检测(开发中)
 
 ## 要求
-- Zig 0.15.2 及以上版本
+
+- Zig 0.16.0 及以上版本
+- 本地存在最新 zzig 仓库,默认通过相对路径 ../ZZig 引用
 
 ## 构建与运行
+
 ```bash
 # 构建项目
 zig build
@@ -39,7 +42,8 @@ zig build run
 ```
 
 会看到如下菜单:
-```
+
+```text
 === Zig IP Scan 交互式菜单 ===
 请选择扫描模式:
   1) 本机子网 (local)    # 自动检测网卡,扫描本机所在子网
@@ -47,11 +51,6 @@ zig build run
   3) 局域网 (lan)         # 扫描所有网卡的子网
 ```
 
-### 2. 命令行模式
-
-适合脚本自动化:
-
-```bash
 ### 2. 命令行模式
 
 适合脚本自动化:
@@ -89,7 +88,7 @@ zig build run -- --mode local --action scan --port 443
 
 ## 依赖
 
-- [zzig](https://github.com/PeiKeSmart/zzig.git): 控制台工具库,提供 UTF-8 支持和 ANSI 颜色
+- [zzig](https://github.com/PeiKeSmart/zzig.git): 默认使用本地最新仓库 ../ZZig,提供控制台、输入兼容层和跨版本辅助
 
 ## 开发状态
 
@@ -98,7 +97,8 @@ zig build run -- --mode local --action scan --port 443
 - ✅ 命令行参数解析
 - ✅ zzig 依赖集成
 - ✅ 跨平台 stdin/stdout 支持
-- 🚧 网卡自动检测(待实现)
+- ✅ 本机子网自动选取网卡
+- ✅ 可通过 --iface 按名称/描述/CIDR 筛选本机网卡
 - 🚧 CIDR 解析与 IP 枚举(待实现)
 - 🚧 TCP 连通性检测(待实现)
 - 🚧 主机发现功能(待实现)
@@ -106,7 +106,7 @@ zig build run -- --mode local --action scan --port 443
 
 ## 技术特点
 
-- **Zig 0.15.2+ 兼容**: 使用最新 API,符合官方最佳实践
+- **Zig 0.16.0+ 兼容**: 已迁移到 std.process.Init、std.Io.net 和最新 zzig 兼容层
 - **零依赖启动**: 核心功能不依赖第三方网络库
 - **跨平台原生支持**: Windows/Linux/macOS 统一代码
 - **性能优先**: 避免不必要的内存分配,适合高并发场景

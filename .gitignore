@@ -2,6 +2,7 @@
 zig-cache/
 .zig-cache/
 zig-out/
+zig-pkg/
 
 # Compiled binaries & objects (when using zig build-exe)
 *.o
@@ -29,3 +30,4 @@ Thumbs.db
 .vs/
 .history/
 lan_output.txt
+.claude/settings.local.json

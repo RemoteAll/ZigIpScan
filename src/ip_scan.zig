@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("zzig").compat;
 
 // Windows ARP API
 const windows = if (@import("builtin").os.tag == .windows) struct {
@@ -46,6 +47,18 @@ fn isVirtualAdapter(name: []const u8) bool {
         if (std.mem.indexOf(u8, name_lower, keyword_lower) != null) {
             return true;
         }
+    }
+
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (std.mem.indexOf(u8, haystack, needle) != null) return true;
+    if (needle.len > haystack.len) return false;
+
+    for (0..haystack.len - needle.len + 1) |start| {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
     }
 
     return false;
@@ -141,12 +154,9 @@ fn macToString(mac: [6]u8, buf: []u8) ![]u8 {
 fn testTcpPort(ip_str: []const u8, port: u16, timeout_ms: u32) bool {
     _ = timeout_ms;
 
-    // 解析地址
-    const addr = std.net.Address.parseIp(ip_str, port) catch return false;
-
     // 尝试连接
-    const stream = std.net.tcpConnectToAddress(addr) catch return false;
-    defer stream.close();
+    const stream = compat.net.connectTcp(ip_str, port) catch return false;
+    defer stream.close(compat.currentIo());
 
     return true;
 }
@@ -206,7 +216,7 @@ const ArpScanTask = struct {
     start_idx: usize, // 起始索引
     end_idx: usize, // 结束索引
     found_hosts: *std.ArrayList(HostInfo),
-    mutex: *std.Thread.Mutex,
+    mutex: *compat.Mutex,
     progress_counter: *usize,
     total_count: usize,
 };
@@ -214,7 +224,7 @@ const ArpScanTask = struct {
 /// ARP 工作线程
 fn arpWorker(task: *ArpScanTask) void {
     // 批量缓存结果，减少锁竞争
-    var local_hosts: std.ArrayList(HostInfo) = .{};
+    var local_hosts: std.ArrayList(HostInfo) = .empty;
     defer local_hosts.deinit(task.allocator);
 
     var local_progress: usize = 0;
@@ -257,8 +267,8 @@ fn discoverHostByArpConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_
 
 /// 并发 ARP 扫描（可指定优先扫描的 IP）
 fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize, local_ip: ?u32) !std.ArrayList(HostInfo) {
-    var found_hosts: std.ArrayList(HostInfo) = .{};
-    var mutex = std.Thread.Mutex{};
+    var found_hosts: std.ArrayList(HostInfo) = .empty;
+    var mutex = compat.Mutex{};
     var progress_counter: usize = 0;
 
     // 生成扫描顺序：优先本机 IP，然后是邻近 IP，最后是远端 IP
@@ -351,13 +361,13 @@ fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip
     }
 
     // 显示进度（降低更新频率减少开销）
-    const start_time = std.time.milliTimestamp();
+    const start_time = compat.milliTimestamp();
 
     // 进度显示循环
     while (true) {
-        std.Thread.sleep(500 * std.time.ns_per_ms); // 500ms 更新一次，提高响应性
+        compat.sleep(500 * std.time.ns_per_ms); // 500ms 更新一次，提高响应性
 
-        const current_time = std.time.milliTimestamp();
+        const current_time = compat.milliTimestamp();
 
         mutex.lock();
         const current_progress = progress_counter;
@@ -392,7 +402,7 @@ fn discoverHostByArpConcurrentWithPriority(allocator: std.mem.Allocator, base_ip
         }
     }
 
-    const total_time = @divFloor(std.time.milliTimestamp() - start_time, 1000);
+    const total_time = @divFloor(compat.milliTimestamp() - start_time, 1000);
     const avg_speed = if (total_time > 0) @divFloor(host_count, @as(usize, @intCast(total_time))) else 0;
     std.debug.print("\n⚡ 扫描完成！用时 {d} 秒，平均速度 {d} IP/s                  \n\n", .{ total_time, avg_speed });
 
@@ -405,8 +415,7 @@ fn pingHost(allocator: std.mem.Allocator, ip_str: []const u8) bool {
 
     if (builtin.os.tag == .windows) {
         // Windows: ping -n 1 -w 200 <ip>
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = compat.process.run(allocator, .{
             .argv = &[_][]const u8{ "ping", "-n", "1", "-w", "200", ip_str },
         }) catch return false;
         defer allocator.free(result.stdout);
@@ -417,8 +426,7 @@ fn pingHost(allocator: std.mem.Allocator, ip_str: []const u8) bool {
             std.mem.indexOf(u8, result.stdout, "ttl=") != null;
     } else {
         // Linux/Unix: ping -c 1 -W 1 <ip>
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = compat.process.run(allocator, .{
             .argv = &[_][]const u8{ "ping", "-c", "1", "-W", "1", ip_str },
         }) catch return false;
         defer allocator.free(result.stdout);
@@ -442,7 +450,7 @@ const PingScanTask = struct {
     start_ip: u32,
     end_ip: u32,
     found_ips: *std.ArrayList(u32),
-    mutex: *std.Thread.Mutex,
+    mutex: *compat.Mutex,
     progress_counter: *usize,
     total_count: usize,
 };
@@ -468,8 +476,8 @@ fn pingWorker(task: *PingScanTask) void {
 
 /// 并发 ICMP Ping 扫描
 fn discoverHostByPingConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize) !std.ArrayList(u32) {
-    var found_ips: std.ArrayList(u32) = .{};
-    var mutex = std.Thread.Mutex{};
+    var found_ips: std.ArrayList(u32) = .empty;
+    var mutex = compat.Mutex{};
     var progress_counter: usize = 0;
 
     const ips_per_thread = (host_count + thread_count - 1) / thread_count;
@@ -501,9 +509,9 @@ fn discoverHostByPingConcurrent(allocator: std.mem.Allocator, base_ip: u32, host
     }
 
     // 显示进度
-    const start_time = std.time.milliTimestamp();
+    const start_time = compat.milliTimestamp();
     while (progress_counter < host_count) {
-        std.Thread.sleep(300 * std.time.ns_per_ms);
+        compat.sleep(300 * std.time.ns_per_ms);
 
         mutex.lock();
         const current_progress = progress_counter;
@@ -511,7 +519,7 @@ fn discoverHostByPingConcurrent(allocator: std.mem.Allocator, base_ip: u32, host
         mutex.unlock();
 
         const progress = @as(f64, @floatFromInt(current_progress)) / @as(f64, @floatFromInt(host_count)) * 100;
-        const elapsed = @divFloor(std.time.milliTimestamp() - start_time, 1000);
+        const elapsed = @divFloor(compat.milliTimestamp() - start_time, 1000);
         std.debug.print("  进度: {d:.1}% ({d}/{d}) 已发现: {d} 用时: {d}s        \r", .{ progress, current_progress, host_count, current_found, elapsed });
     }
 
@@ -533,7 +541,7 @@ const ScanTask = struct {
     start_ip: u32,
     end_ip: u32,
     found_ips: *std.ArrayList(u32),
-    mutex: *std.Thread.Mutex,
+    mutex: *compat.Mutex,
     progress_counter: *usize,
     total_count: usize,
 };
@@ -559,8 +567,8 @@ fn scanWorker(task: *ScanTask) void {
 
 /// 并发主机发现
 fn discoverHostConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, thread_count: usize) !std.ArrayList(u32) {
-    var found_ips: std.ArrayList(u32) = .{};
-    var mutex = std.Thread.Mutex{};
+    var found_ips: std.ArrayList(u32) = .empty;
+    var mutex = compat.Mutex{};
     var progress_counter: usize = 0;
 
     const ips_per_thread = (host_count + thread_count - 1) / thread_count;
@@ -592,9 +600,9 @@ fn discoverHostConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count
     }
 
     // 显示进度
-    const start_time = std.time.milliTimestamp();
+    const start_time = compat.milliTimestamp();
     while (progress_counter < host_count) {
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        compat.sleep(500 * std.time.ns_per_ms);
 
         mutex.lock();
         const current_progress = progress_counter;
@@ -602,7 +610,7 @@ fn discoverHostConcurrent(allocator: std.mem.Allocator, base_ip: u32, host_count
         mutex.unlock();
 
         const progress = @as(f64, @floatFromInt(current_progress)) / @as(f64, @floatFromInt(host_count)) * 100;
-        const elapsed = @divFloor(std.time.milliTimestamp() - start_time, 1000);
+        const elapsed = @divFloor(compat.milliTimestamp() - start_time, 1000);
         std.debug.print("  进度: {d:.1}% ({d}/{d}) 已发现: {d} 用时: {d}s        \r", .{ progress, current_progress, host_count, current_found, elapsed });
     }
 
@@ -729,15 +737,14 @@ const NetworkInterface = struct {
 
 /// 获取本机所有网卡信息
 fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
-    var interfaces: std.ArrayList(NetworkInterface) = .{};
+    var interfaces: std.ArrayList(NetworkInterface) = .empty;
     errdefer interfaces.deinit(allocator);
 
     const builtin = @import("builtin");
 
     if (builtin.os.tag == .windows) {
         // Windows: 使用 ipconfig /all 命令解析（获取描述信息）
-        const result = try std.process.Child.run(.{
-            .allocator = allocator,
+        const result = try compat.process.run(allocator, .{
             .argv = &[_][]const u8{ "cmd", "/c", "chcp 65001 >nul && ipconfig /all" },
         });
         defer allocator.free(result.stdout);
@@ -939,14 +946,12 @@ fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
         }
     } else {
         // Unix/Linux: 使用 ip addr 或 ifconfig
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = compat.process.run(allocator, .{
             .argv = &[_][]const u8{ "ip", "addr" },
         }) catch |err| {
             // 尝试 ifconfig
             if (err == error.FileNotFound) {
-                const ifconfig_result = try std.process.Child.run(.{
-                    .allocator = allocator,
+                const ifconfig_result = try compat.process.run(allocator, .{
                     .argv = &[_][]const u8{"ifconfig"},
                 });
                 defer allocator.free(ifconfig_result.stdout);
@@ -1027,19 +1032,139 @@ fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
     return try interfaces.toOwnedSlice(allocator);
 }
 
+fn freeNetworkInterfaces(allocator: std.mem.Allocator, interfaces: []const NetworkInterface) void {
+    for (interfaces) |iface| {
+        allocator.free(iface.name);
+        allocator.free(iface.description);
+        allocator.free(iface.cidr);
+    }
+    allocator.free(interfaces);
+}
+
+fn getInterfacePriority(iface: NetworkInterface) u8 {
+    const last_octet = @as(u8, @intCast(iface.ip & 0xFF));
+    var priority: u8 = if (iface.is_virtual) 200 else 100;
+
+    if (!iface.is_virtual) {
+        if (last_octet >= 10 and last_octet <= 253)
+            priority = 0
+        else if (last_octet >= 2 and last_octet <= 9)
+            priority = 30
+        else if (last_octet == 1 or last_octet == 254)
+            priority = 50;
+    }
+
+    if (iface.prefix_len < 20 and priority <= 245) priority += 10;
+    return priority;
+}
+
+fn matchesInterfaceFilter(iface: NetworkInterface, iface_filter: []const u8) bool {
+    return containsIgnoreCase(iface.name, iface_filter) or
+        containsIgnoreCase(iface.description, iface_filter) or
+        containsIgnoreCase(iface.cidr, iface_filter);
+}
+
+fn findPreferredInterface(interfaces: []const NetworkInterface, iface_filter: ?[]const u8) ?NetworkInterface {
+    var best: ?NetworkInterface = null;
+    var best_priority: u8 = std.math.maxInt(u8);
+
+    for (interfaces) |iface| {
+        if (iface_filter) |filter| {
+            if (filter.len > 0 and !matchesInterfaceFilter(iface, filter)) continue;
+        }
+
+        const priority = getInterfacePriority(iface);
+        if (best == null or priority < best_priority) {
+            best = iface;
+            best_priority = priority;
+        }
+    }
+
+    return best;
+}
+
+fn printAvailableInterfaces(interfaces: []const NetworkInterface) void {
+    std.debug.print("可用网卡:\n", .{});
+    for (interfaces) |iface| {
+        std.debug.print("  • {s}  [{s}]\n", .{ iface.cidr, iface.name });
+        std.debug.print("    描述: {s}\n", .{iface.description});
+    }
+}
+
+pub fn discoverLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !void {
+    std.debug.print("\n🔍 开始本机子网扫描...\n", .{});
+    std.debug.print("正在枚举网卡...\n\n", .{});
+
+    const interfaces = try getNetworkInterfaces(allocator);
+    defer freeNetworkInterfaces(allocator, interfaces);
+
+    if (interfaces.len == 0) {
+        std.debug.print("❌ 未检测到有效网卡\n", .{});
+        return;
+    }
+
+    const selected = findPreferredInterface(interfaces, iface_filter) orelse {
+        if (iface_filter) |filter| {
+            std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
+        } else {
+            std.debug.print("❌ 未找到可用于本机子网扫描的网卡\n\n", .{});
+        }
+        printAvailableInterfaces(interfaces);
+        return;
+    };
+
+    var ip_buf: [16]u8 = undefined;
+    const ip_str = try ipToString(selected.ip, &ip_buf);
+    std.debug.print("已选择网卡:\n", .{});
+    std.debug.print("  名称: {s}\n", .{selected.name});
+    std.debug.print("  描述: {s}\n", .{selected.description});
+    std.debug.print("  本机 IP: {s}\n", .{ip_str});
+    std.debug.print("  子网: {s}\n\n", .{selected.cidr});
+
+    try discoverRange(allocator, selected.cidr);
+}
+
+pub fn scanLocal(allocator: std.mem.Allocator, iface_filter: ?[]const u8, port: u16) !void {
+    std.debug.print("\n🔍 开始本机子网端口扫描...\n", .{});
+    std.debug.print("目标端口: {d}\n", .{port});
+    std.debug.print("正在枚举网卡...\n\n", .{});
+
+    const interfaces = try getNetworkInterfaces(allocator);
+    defer freeNetworkInterfaces(allocator, interfaces);
+
+    if (interfaces.len == 0) {
+        std.debug.print("❌ 未检测到有效网卡\n", .{});
+        return;
+    }
+
+    const selected = findPreferredInterface(interfaces, iface_filter) orelse {
+        if (iface_filter) |filter| {
+            std.debug.print("❌ 未找到匹配的网卡: {s}\n\n", .{filter});
+        } else {
+            std.debug.print("❌ 未找到可用于本机子网扫描的网卡\n\n", .{});
+        }
+        printAvailableInterfaces(interfaces);
+        return;
+    };
+
+    var ip_buf: [16]u8 = undefined;
+    const ip_str = try ipToString(selected.ip, &ip_buf);
+    std.debug.print("已选择网卡:\n", .{});
+    std.debug.print("  名称: {s}\n", .{selected.name});
+    std.debug.print("  描述: {s}\n", .{selected.description});
+    std.debug.print("  本机 IP: {s}\n", .{ip_str});
+    std.debug.print("  子网: {s}\n\n", .{selected.cidr});
+
+    try scanRange(allocator, selected.cidr, port);
+}
+
 /// 扫描局域网（所有网卡的子网）
 pub fn discoverLan(allocator: std.mem.Allocator) !void {
     std.debug.print("\n🔍 开始局域网扫描...\n", .{});
     std.debug.print("正在枚举网卡...\n\n", .{});
 
     const interfaces = try getNetworkInterfaces(allocator);
-    defer {
-        for (interfaces) |iface| {
-            allocator.free(iface.name);
-            allocator.free(iface.cidr);
-        }
-        allocator.free(interfaces);
-    }
+    defer freeNetworkInterfaces(allocator, interfaces);
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
@@ -1060,37 +1185,7 @@ pub fn discoverLan(allocator: std.mem.Allocator) !void {
     defer allocator.free(sorted_interfaces);
 
     for (interfaces, 0..) |iface, i| {
-        const last_octet = @as(u8, @intCast(iface.ip & 0xFF));
-
-        // 计算优先级（数字越小越优先）
-        var priority: u8 = 0;
-
-        if (iface.is_virtual) {
-            // 虚拟网卡：最低优先级（基础分 200）
-            priority = 200;
-        } else {
-            // 物理网卡：根据 IP 末位判断
-            if (last_octet >= 10 and last_octet <= 253) {
-                // DHCP 范围 - 真实局域网设备（最高优先级）
-                priority = 0;
-            } else if (last_octet >= 2 and last_octet <= 9) {
-                // 静态 IP 低段 - 可能是服务器（中高优先级）
-                priority = 30;
-            } else if (last_octet == 1 or last_octet == 254) {
-                // 网关/广播 - 通常是路由器（中等优先级）
-                priority = 50;
-            } else {
-                // 其他情况
-                priority = 100;
-            }
-        }
-
-        // 子网掩码调整：较大子网（如 /16）降低优先级
-        if (iface.prefix_len < 20) {
-            priority += 10; // /16 等大子网通常是虚拟网络
-        }
-
-        sorted_interfaces[i] = .{ .iface = iface, .priority = priority };
+        sorted_interfaces[i] = .{ .iface = iface, .priority = getInterfacePriority(iface) };
     }
 
     // 按优先级排序（冒泡排序）
@@ -1188,14 +1283,7 @@ pub fn scanLan(allocator: std.mem.Allocator, port: u16) !void {
     std.debug.print("正在枚举网卡...\n\n", .{});
 
     const interfaces = try getNetworkInterfaces(allocator);
-    defer {
-        for (interfaces) |iface| {
-            allocator.free(iface.name);
-            allocator.free(iface.description);
-            allocator.free(iface.cidr);
-        }
-        allocator.free(interfaces);
-    }
+    defer freeNetworkInterfaces(allocator, interfaces);
 
     if (interfaces.len == 0) {
         std.debug.print("❌ 未检测到有效网卡\n", .{});
