@@ -31,6 +31,59 @@ zig build run
 zig build run -- --help
 ```
 
+## 最小发布与 UPX 压缩
+
+如果要做便于分发的小体积版本，建议先构建 `ReleaseSmall`，再按需使用 UPX。
+
+### 1. 生成最小版
+
+```powershell
+zig build -Doptimize=ReleaseSmall --prefix zig-out-small
+```
+
+如果想直接一键完成构建、UPX 压缩和 zip 打包，可以直接执行：
+
+```powershell
+.\pack_upx.ps1
+```
+
+当前最小版可执行文件路径：
+
+1. `zig-out-small\bin\zig-ip-scan.exe`
+2. `release\zig-ip-scan-min\zig-ip-scan.exe`
+3. `release\zig-ip-scan-min-upx\zig-ip-scan.exe`
+
+### 2. 安装 UPX
+
+Windows 下可以任选一种方式安装：
+
+```powershell
+winget install --id UPX.UPX -e --accept-package-agreements --accept-source-agreements
+```
+
+或：
+
+```powershell
+choco install upx -y
+```
+
+### 3. 压缩发布文件
+
+建议保留原始最小版，再额外复制一份做 UPX 压缩：
+
+```powershell
+New-Item -ItemType Directory -Force -Path .\release\zig-ip-scan-min-upx | Out-Null
+Copy-Item .\zig-out-small\bin\zig-ip-scan.exe .\release\zig-ip-scan-min-upx\zig-ip-scan.exe -Force
+upx --best --lzma .\release\zig-ip-scan-min-upx\zig-ip-scan.exe
+Compress-Archive -Path .\release\zig-ip-scan-min-upx\zig-ip-scan.exe -DestinationPath .\release\zig-ip-scan-min-upx-win-x64.zip -Force
+```
+
+### 4. 使用建议
+
+1. 先保留一份未压缩 exe，方便做体积和兼容性对比
+2. 如果当前终端找不到 `upx`，重新打开终端再执行
+3. 压缩完成后，建议重新运行一次扫描命令确认行为未变
+
 ## 使用方式
 
 ### 1. 交互式菜单
